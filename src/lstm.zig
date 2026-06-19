@@ -194,7 +194,7 @@ pub const LstmLayer = struct {
         for (0..self.num_cells) |i| {
             var f = neurons.weights[i * row_size + input_symbol];
             for (input, 0..) |inp_val, j| {
-                f += inp_val * neurons.weights[i * row_size + offset + j];
+                f += inp_val * neurons.weights[i * row_size + self.output_size + j];
             }
             neurons.norm[self.epoch * self.num_cells + i] = f;
         }
@@ -300,7 +300,7 @@ pub const LstmLayer = struct {
         for (0..self.num_cells) |i| {
             const w_row = i * row_size;
             for (input, 0..) |inp_val, j| {
-                neurons.update[w_row + offset + j] += neurons.error_grad[i] * inp_val;
+                neurons.update[w_row + self.output_size + j] += neurons.error_grad[i] * inp_val;
             }
             neurons.update[w_row + input_symbol] += neurons.error_grad[i];
         }
@@ -404,7 +404,7 @@ pub const Lstm = struct {
     last_input: i32 = -1,
 
     pub fn init(allocator: std.mem.Allocator, input_size: usize, output_size: usize, num_cells: usize, horizon: usize, learning_rate: f32, gradient_clip: f32, random: std.Random) !Lstm {
-        const layers = try LstmLayer.init(allocator, input_size + 1 + num_cells, input_size, output_size, num_cells, horizon, gradient_clip, learning_rate, random);
+        const layers = try LstmLayer.init(allocator, input_size + 1 + num_cells + output_size, input_size, output_size, num_cells, horizon, gradient_clip, learning_rate, random);
 
         const input_history = try allocator.alloc(u8, horizon);
         @memset(input_history, 0);

@@ -66,8 +66,8 @@ pub const BracketStatsPair = struct {
 pub const BracketModel = struct {
     vocab: [256]bool,
     probs: [256]f32 = undefined,
-    top: u8 = 255,
-    bot: u8 = 0,
+    top: usize = 255,
+    bot: usize = 0,
     active: BoundedArrayU8,
     distance: BoundedArrayU32,
     stats: *[256][200]BracketStatsPair,

@@ -13,13 +13,6 @@ pub var model_predictions: [431]f32 = [_]f32{0.5} ** 431;
 pub fn addPrediction(x_val: i32) void {
     if (prediction_index < 431) {
         model_predictions[prediction_index] = @as(f32, @floatFromInt(x_val)) * (1.0 / 4095.0);
-        if (x.blpos == 0) {
-            std.debug.print("[DEBUG addPrediction] index={d}, val={d}, float={d:.4}, blpos={d}\n", .{prediction_index, x_val, model_predictions[prediction_index], x.blpos});
-        } else {
-            if (prediction_index == 0) {
-                std.debug.print("[DEBUG addPrediction idx0] blpos={d}\n", .{x.blpos});
-            }
-        }
         prediction_index += 1;
     }
 }
@@ -2611,18 +2604,18 @@ pub const SparseMatchModel = struct {
     }
 
     pub fn predict(self: *SparseMatchModel, inputs: *Inputs, pos_val: u32, buffer_ptr: []const u8, c0: i32, bpos: i32) u32 {
-        const c0b = @as(u8, @intCast(c0 << @as(u3, @intCast(8 - bpos))));
+        const c0b = @as(u8, @truncate(@as(u32, @bitCast(c0)) << @as(u5, @intCast(8 - bpos))));
         if (bpos == 0) {
             self.update_model(pos_val, buffer_ptr);
         }
 
-        if (self.length > 0 and (((self.expectedByte ^ c0b) >> @as(u3, @intCast(8 - bpos))) != 0)) {
+        if (self.length > 0 and (((@as(u32, self.expectedByte ^ c0b)) >> @as(u5, @intCast(8 - bpos))) != 0)) {
             self.length = 0;
         }
 
         if (self.valid) {
             if (self.length > 1) {
-                const expectedBit = (self.expectedByte >> @as(u3, @intCast(7 - bpos))) & 1;
+                const expectedBit = (@as(u32, self.expectedByte) >> @as(u5, @intCast(7 - bpos))) & 1;
                 const sign: i32 = if (expectedBit != 0) 1 else -1;
                 inputs.add(sign * (@as(i32, @intCast(@min(self.length - 1, 32))) << 5));
                 const term1 = @as(i32, 1) << @as(u5, @intCast(@min(self.length - 2, 3)));
@@ -2793,7 +2786,7 @@ pub var ctx: [3]u32 = [_]u32{0} ** 3;
 pub fn isMMatch(pos_val: u32, min_len: u32, buffer_ptr: []const u8) bool {
     var length: u32 = 1;
     while (length <= min_len) : (length += 1) {
-        if (buffer_ptr[(pos - length) & BMASK] != buffer_ptr[(pos_val - length) & BMASK]) {
+        if (buffer_ptr[(pos -% length) & BMASK] != buffer_ptr[(pos_val -% length) & BMASK]) {
             return false;
         }
     }
@@ -2825,7 +2818,7 @@ pub fn addCandidates(matches: *HashElementForMatchPositions, len: u32, buffer_pt
 pub fn matchModel2update(buffer_ptr: []const u8) void {
     const n = @max(numberOfActiveCandidates, 1);
     var i: usize = 0;
-    while (i < n) : (i += 1) {
+    while (i < n) {
         var matchInfo = &matchCandidates[i];
         matchInfo.update(buffer_ptr);
         if (numberOfActiveCandidates != 0 and matchInfo.isInNoMatchMode()) {
@@ -2835,7 +2828,8 @@ pub fn matchModel2update(buffer_ptr: []const u8) void {
             while (k < numberOfActiveCandidates) : (k += 1) {
                 matchCandidates[k] = matchCandidates[k + 1];
             }
-            i -= 1;
+        } else {
+            i += 1;
         }
     }
 
@@ -3324,10 +3318,12 @@ pub const Fxcm = struct {
     pub fn predict(self: *Fxcm, lstmpr_val: i32, lstmex_val: i32) f32 {
         _ = self;
         resetPredictions();
+        x.mxInputs1.ncount = 0;
+        x.mxInputs2.ncount = 0;
         wrtcxt = deccode;
         mxA[8].cxt = @intCast(deccode);
 
-        const c0b = x.c0 << @as(u3, @intCast(8 - x.bpos));
+        const c0b = x.c0 << @as(u5, @intCast(8 - x.bpos));
 
         scmA[0].mix(&x.mxInputs1, sscmrate, x.y);
         scmA[1].mix(&x.mxInputs1, sscmrate, x.y);
@@ -3394,7 +3390,7 @@ pub const Fxcm = struct {
         if (x.bpos != 0) {
             c_val = @intCast(c0b);
             if (x.bpos == 1) {
-                c_val = c_val + @as(i32, @intCast(16 * (words * 2 & 4)));
+                c_val = c_val + 16 * ((@as(i32, words) * 2) & 4);
             } else if (x.bpos > 3) {
                 c_val = @as(i32, @intCast(wrt_2b[@intCast(c0b & 255)])) * 64;
             }
@@ -3405,9 +3401,9 @@ pub const Fxcm = struct {
         mxA[1].cxt = @intCast(c_val);
 
         mxA[2].cxt = @intCast(((4 * @as(i32, @intCast(words))) & 0xf0) * 4 + ordX * 256 * 4 + @as(i32, @intCast(stream2b & 63)));
-        mxA[6].cxt = @intCast((@as(i32, @intCast(stream3bR)) & 0xff8) * 4 + ((2 * @as(i32, @intCast(words))) & 0x1c) + @as(i32, @intCast(stream2b & 3)));
+        mxA[6].cxt = @intCast((@as(i32, @bitCast(stream3bR)) & 0xff8) * 4 + ((2 * @as(i32, @intCast(words))) & 0x1c) + @as(i32, @intCast(stream2b & 3)));
 
-        mxA[3].cxt = @intCast(x.bpos * 256 + ((((~@as(i32, @intCast(numbers | words)) << @as(u3, @intCast(x.bpos))) & 255) >> @as(u3, @intCast(x.bpos))) | @as(i32, @intCast(c0b))));
+        mxA[3].cxt = @intCast(x.bpos * 256 + ((((@as(i32, @intCast(numbers | words)) << @as(u3, @intCast(x.bpos))) & 255) >> @as(u3, @intCast(x.bpos))) | @as(i32, @intCast(c0b & 255))));
 
         mxA[10].cxt = @intCast((ordX * 8 + @as(i32, @intFromBool(BrFcIdx != 0)) * 4 + @as(i32, @intCast(stream2b & 3))) * 2 + (words & 1));
 
@@ -3460,14 +3456,7 @@ pub const Fxcm = struct {
 
         const final_p = @as(f32, @floatFromInt(squash((mxA[10].p1() * 7 + mxA[11].p1() + 4) >> 3))) * (1.0 / 4095.0);
 
-        if (x.blpos < 5 and x.bpos == 0) {
-            std.debug.print("[DEBUG FXCM] predict. prediction_index={d}, final_p={d:.4}, first_pred={d:.4}, last_pred={d:.4}\n", .{
-                prediction_index,
-                final_p,
-                model_predictions[0],
-                model_predictions[430],
-            });
-        }
+
 
         return final_p;
     }
@@ -4102,7 +4091,7 @@ pub const Fxcm = struct {
             } else {
                 indirectWord0Pos = indirectWord0Pos +% (@as(u32, buf(indirectWord0Pos)) << 8) +% (@as(u32, c1) << 16);
             }
-            ind3[context1_ind3] = @intCast((cxtind3 * 32 + c1) & (0x2000000 - 1));
+            ind3[context1_ind3] = @truncate((cxtind3 * 32 + c1) & (0x2000000 - 1));
             context1_ind3 = (context1_ind3 * 32 + c1) & (0x2000000 - 1);
             cxtind3 = ind3[context1_ind3];
 

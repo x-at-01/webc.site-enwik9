@@ -113,8 +113,10 @@ pub const SSEi = struct {
         const mSCALE = SCALE - 1;
         const sse = &self[ctx_idx];
 
-        const sseFreq = @as(usize, @intCast(@divTrunc(6 * iP, SCALE)));
-        X.sw = (6 * iP) & mSCALE;
+        const safe_iP = if (iP < 0) 0 else if (iP >= SCALE) mSCALE else iP;
+
+        const sseFreq = @as(usize, @intCast(@divTrunc(6 * safe_iP, SCALE)));
+        X.sw = (6 * safe_iP) & mSCALE;
         X.sse_idx = sseFreq;
         X.ctx_idx = ctx_idx;
 
@@ -147,11 +149,18 @@ pub const ShelwienMixer = struct {
         self.w = w0 + 16384;
     }
 
+    inline fn rdiv64(x: i64, a: i64, d: u6) i32 {
+        if (x >= 0) {
+            return @intCast((x + a) >> d);
+        } else {
+            return @intCast((x - a) >> d);
+        }
+    }
+
     pub inline fn Mixup(self: *ShelwienMixer, s1: i32, s0: i32) i32 {
         const SCALE = 32768;
-        const SCALElog = 15;
-        const diff = (self.w - 16384) * (s0 - s1);
-        const x_val = s1 + rdiv(diff, 16384, SCALElog);
+        const diff = @as(i64, self.w - 16384) * @as(i64, s0 - s1);
+        const x_val = s1 + rdiv64(diff, 16384, 15);
         var res = x_val;
         if (res > 0) {
             if (res < SCALE) {
@@ -167,20 +176,13 @@ pub const ShelwienMixer = struct {
 
     pub inline fn Update(self: *ShelwienMixer, y: i32, p0: i32, p1: i32, wq: i32, pm: i32) void {
         const SCALE = 32768;
-        const SCALElog = 15;
-        const py = SCALE - (y << SCALElog);
+        const py = SCALE - (y << 15);
         const e = py - pm;
-        var d = rdiv(e * (p0 - p1), 16384, SCALElog);
-        d = rdiv(d * wq, 16384, SCALElog);
-        self.w += d;
-    }
-
-    inline fn rdiv(x: i32, a: i32, d: u5) i32 {
-        if (x >= 0) {
-            return @intCast((x + a) >> d);
-        } else {
-            return @intCast(-((-x + a) >> d));
-        }
+        const diff1 = @as(i64, e) * @as(i64, p0 - p1);
+        var d = rdiv64(diff1, 16384, 15);
+        const diff2 = @as(i64, d) * @as(i64, wq);
+        d = rdiv64(diff2, 16384, 15);
+        self.w = @intCast(@as(i64, self.w) + d);
     }
 };
 
@@ -211,18 +213,32 @@ pub const ShelwienSSE = struct {
     x1: []ShelwienMixer,
     x2: []ShelwienMixer,
 
-    pub fn init(allocator: std.mem.Allocator) !ShelwienSSE {
+    pub fn init(self: *ShelwienSSE, allocator: std.mem.Allocator) !void {
         const M_sm6x_Volume = 3 * 128 * 256 * 256;
         const M_sm7x_Volume = 3 * 32 * 256 * 255;
         const M_mix1_Volume = 4 * 256 * 8 * 79;
         const M_mix2_Volume = 3 * 2 * 256 * 256;
 
-        var self = ShelwienSSE{
-            .s6 = try allocator.alloc(SSEi, M_sm6x_Volume),
-            .s7 = try allocator.alloc(SSEi, M_sm7x_Volume),
-            .x1 = try allocator.alloc(ShelwienMixer, M_mix1_Volume),
-            .x2 = try allocator.alloc(ShelwienMixer, M_mix2_Volume),
-        };
+        self.s6 = try allocator.alloc(SSEi, M_sm6x_Volume);
+        self.s7 = try allocator.alloc(SSEi, M_sm7x_Volume);
+        self.x1 = try allocator.alloc(ShelwienMixer, M_mix1_Volume);
+        self.x2 = try allocator.alloc(ShelwienMixer, M_mix2_Volume);
+
+        self.su6 = SSEi_updstr{};
+        self.su7 = SSEi_updstr{};
+        self.sm6x = 0;
+        self.mix1 = 0;
+        self.sm7x = 0;
+        self.mix2 = 0;
+        self.mix1_s0 = 0;
+        self.mix1_s1 = 0;
+        self.mix1_p = 0;
+        self.mix2_s0 = 0;
+        self.mix2_s1 = 0;
+        self.mix2_p = 0;
+        self.M_j = 1;
+        self.M_pc = 0;
+        self.M_ffl = 0;
 
         self.initSTSQ();
 
@@ -230,8 +246,6 @@ pub const ShelwienSSE = struct {
         for (self.s7) |*s| s.init(8192);
         for (self.x1) |*x| x.init(7648);
         for (self.x2) |*x| x.init(2560);
-
-        return self;
     }
 
     pub fn deinit(self: *ShelwienSSE, allocator: std.mem.Allocator) void {
@@ -350,9 +364,11 @@ pub const ShelwienSSE = struct {
     }
 
     pub fn predict(self: *ShelwienSSE, input: f32) f32 {
-        const discrete = 1 + @as(i32, @intFromFloat((1.0 - input) * 32766.0));
+        const safe_input = if (input < 0.0) 0.0 else if (input > 1.0) 1.0 else input;
+        const discrete = 1 + @as(i32, @intFromFloat((1.0 - safe_input) * 32766.0));
         const est = self.estimate(discrete);
-        return 1.0 - (@as(f32, @floatFromInt(est - 1)) / 32766.0);
+        const est_f = @as(f32, @floatFromInt(est)) - 1.0;
+        return 1.0 - (est_f / 32766.0);
     }
 
     pub fn perceive(self: *ShelwienSSE, bit: u1) void {

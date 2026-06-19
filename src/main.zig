@@ -81,6 +81,14 @@ fn compressFile(io: std.Io, allocator: std.mem.Allocator, input_path: []const u8
         while (true) {
             const bit = @as(u1, @intCast((byte >> shift) & 1));
             const p = pred.predict();
+            if (std.math.isNan(p)) {
+                std.debug.print("PANIC: pred.predict() returned NaN! bc={d}, tree1=0x{x}, tree3=0x{x}\n", .{
+                    pred.bit_context,
+                    @as(u32, @bitCast(pred.byte_mixer_tree[1])),
+                    @as(u32, @bitCast(pred.byte_mixer_tree[3])),
+                });
+                std.process.exit(1);
+            }
 
             const pos0 = pred.is_possible[2 * pred.bit_context];
             const pos1 = pred.is_possible[2 * pred.bit_context + 1];

@@ -245,10 +245,60 @@ pub const Predictor = struct {
             .is_possible = is_possible,
             .shared_map = shared_map,
             .history = history,
+            .history_pos = 0,
+            .bit_context = 1,
+            .steps = 0,
+            .bpos = 0,
             .hashes_ind1 = hashes_ind1,
             .hashes_ind2 = hashes_ind2,
             .hashes_ind3 = hashes_ind3,
             .hashes_ind5 = hashes_ind5,
+            .ind1 = 0,
+            .ind2 = 0,
+            .ind3 = 0,
+            .ind5 = 0,
+            .context1_ind = 0,
+            .context1_ind2 = 0,
+            .context1_ind3 = 0,
+            .context1_ind5 = 0,
+            .words = .{0} ** 8,
+            .recent_bytes = .{0} ** 8,
+            .b2stream = 0,
+            .b3stream = 0,
+            .b4stream = 0,
+            .stream2bR = 0,
+            .stream3bR = 0,
+            .o2bState = 0,
+            .n2bState = 0,
+            .o3bState = 0,
+            .n3bState = 0,
+            .mx5 = 0,
+            .mx6 = 0,
+            .mx7 = 0,
+            .mx8 = 0,
+            .mx9 = 0,
+            .mx9cxt = 0,
+            .mx10 = 0,
+            .mx10cxt = 0,
+            .mx11 = 0,
+            .mx11cxt = 0,
+            .mx12 = 0,
+            .mx12cxt = 0,
+            .mx13 = 0,
+            .mx13cxt = 0,
+            .mx14 = 0,
+            .mx15 = 0,
+            .mx16 = 0,
+            .mx17 = 0,
+            .mx18 = 0,
+            .mx18cxt = 0,
+            .words_state = 0,
+            .wordscxt = 0,
+            .line_break = 0,
+            .longest_match = 0,
+            .auxiliary_context = 0,
+            .b2streamcxt = 0,
+            .b3streamcxt = 0,
 
             .orders = undefined,
             .sparse_models = undefined,
@@ -257,7 +307,7 @@ pub const Predictor = struct {
             .double_indirect_models = undefined,
             .direct_bracket_model = try DirectModel.init(allocator, 51400, 30, 0.0),
 
-            .sse = try ShelwienSSE.init(allocator),
+            .sse = undefined,
             .ppm = try PpmModel.init(allocator, vocab),
             .bracket = try BracketModel.init(allocator, vocab),
             .fxcm = try Fxcm.init(allocator),
@@ -268,6 +318,8 @@ pub const Predictor = struct {
             .byte_mixer_inputs = byte_mixer_inputs,
             .byte_mixer_probs = [_]f32{0.0} ** 256,
             .byte_mixer_tree = [_]f32{1.0} ** 512,
+            .final_l1_logit = 0.0,
+            .p_l1 = 0.0,
         };
 
         // Initialize array models using comptime configs
@@ -301,6 +353,7 @@ pub const Predictor = struct {
 
         // Layer 1 Mixer: mixes 23 mixers + 488 base models = 511 inputs
         self.mixer_l1 = try Mixer.init(allocator, 1, 511, 0.0005);
+        try self.sse.init(allocator);
 
         return self;
     }
@@ -350,7 +403,14 @@ pub const Predictor = struct {
         }
 
         const lstmpr_float = self.predict_lstm_bit(bc);
-        std.debug.print("[DEBUG PREDICT] bc={d}, lstmpr_float={d}, tree[1]={d}, tree[3]={d}\n", .{bc, lstmpr_float, self.byte_mixer_tree[1], self.byte_mixer_tree[3]});
+        if (std.math.isNan(lstmpr_float)) {
+            std.debug.print("PANIC: lstmpr_float is NaN! bc={d}, tree[1]=0x{x}, tree[3]=0x{x}\n", .{
+                bc,
+                @as(u32, @bitCast(self.byte_mixer_tree[1])),
+                @as(u32, @bitCast(self.byte_mixer_tree[3])),
+            });
+            std.process.exit(1);
+        }
         const lstmpr: i32 = @intFromFloat(1.0 + 4094.0 * lstmpr_float);
 
         return .{ .pr = lstmpr, .ex = lstmex };
@@ -392,54 +452,19 @@ pub const Predictor = struct {
                 }
             }
         }
-        for (self.model_predictions[0..53], 0..) |p, i| {
-            if (std.math.isNan(p)) {
-                std.debug.print("PANIC: model_predictions[{d}] (base models) is NaN: {d}\n", .{i, p});
-                std.process.exit(1);
-            }
-        }
-
         self.model_predictions[53] = self.ppm.predict_bit(bc);
-        if (std.math.isNan(self.model_predictions[53])) {
-            std.debug.print("PANIC: model_predictions[53] (ppm) is NaN. bc={d}, tree[1]={d}\n", .{bc, self.ppm.tree[1]});
-            std.process.exit(1);
-        }
-
         self.model_predictions[54] = self.bracket.predict();
-        if (std.math.isNan(self.model_predictions[54])) {
-            std.debug.print("PANIC: model_predictions[54] (bracket) is NaN. top={d}, bot={d}\n", .{self.bracket.top, self.bracket.bot});
-            std.process.exit(1);
-        }
-
         self.model_predictions[55] = self.predict_lstm_bit(bc);
-        if (std.math.isNan(self.model_predictions[55])) {
-            std.debug.print("PANIC: model_predictions[55] (lstm) is NaN. bc={d}, tree[1]={d}, tree[3]={d}\n", .{bc, self.byte_mixer_tree[1], self.byte_mixer_tree[3]});
-            std.process.exit(1);
-        }
-
         self.model_predictions[56] = self.direct_bracket_model.predict(bc);
-        if (std.math.isNan(self.model_predictions[56])) {
-            std.debug.print("PANIC: model_predictions[56] (direct_bracket) is NaN. bc={d}\n", .{bc});
-            std.process.exit(1);
-        }
 
         // Feed FXCM predictions
         const lstm = self.getLstmprLstmex();
         _ = self.fxcm.predict(lstm.pr, lstm.ex);
         @memcpy(self.model_predictions[57..488], &fxcm.model_predictions);
-        for (self.model_predictions[57..488], 57..) |p, i| {
-            if (std.math.isNan(p)) {
-                std.debug.print("PANIC: model_predictions[{d}] (fxcm) is NaN: {d}\n", .{i, p});
-                std.process.exit(1);
-            }
-        }
 
         // 2. Convert to logit domain
-        for (&self.inputs, self.model_predictions, 0..) |*input, p, i| {
+        for (&self.inputs, self.model_predictions) |*input, p| {
             input.* = logit(p);
-            if (std.math.isNan(input.*)) {
-                std.debug.panic("inputs[{d}] is NaN (p={d})\n", .{i, p});
-            }
         }
 
         // 3. Compute Mixer contexts and mix
@@ -497,9 +522,6 @@ pub const Predictor = struct {
             @memcpy(mixer_inputs[0..488], &self.inputs);
             @memcpy(mixer_inputs[488 .. 488 + i], self.first_stage_logits[0..i]);
             logit_val.* = m.mix(mixer_inputs[0 .. 488 + i]);
-            if (std.math.isNan(logit_val.*)) {
-                std.debug.panic("first_stage_logits[{d}] is NaN\n", .{i});
-            }
         }
 
         // Layer 1 inputs setup: 23 first stage logits + 488 base model inputs = 511 inputs
@@ -509,12 +531,9 @@ pub const Predictor = struct {
         // Layer 1 Mix
         self.mixer_l1.selectContext(0);
         self.final_l1_logit = self.mixer_l1.mix(&self.first_stage_outputs);
-        if (std.math.isNan(self.final_l1_logit)) {
-            std.debug.panic("final_l1_logit is NaN\n", .{});
-        }
         self.p_l1 = logistic(self.final_l1_logit);
         if (std.math.isNan(self.p_l1)) {
-            std.debug.panic("p_l1 is NaN\n", .{});
+            return std.math.nan(f32);
         }
 
         return self.sse.predict(self.p_l1);
@@ -592,7 +611,7 @@ pub const Predictor = struct {
 
         // 6. Update state variables
         self.steps += 1;
-        self.bpos = (self.bpos + 1) & 7;
+        self.bpos = (self.bpos +% 1) & 7;
         self.bit_context = self.bit_context * 2 + bit;
 
         // Byte Boundary check
