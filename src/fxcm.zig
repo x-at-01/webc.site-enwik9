@@ -13,6 +13,9 @@ pub var model_predictions: [431]f32 = [_]f32{0.5} ** 431;
 pub fn addPrediction(x_val: i32) void {
     if (prediction_index < 431) {
         model_predictions[prediction_index] = @as(f32, @floatFromInt(x_val)) * (1.0 / 4095.0);
+        if (x.blpos == 0) {
+            std.debug.print("[DEBUG addPrediction] index={d}, val={d}, float={d:.4}\n", .{prediction_index, x_val, model_predictions[prediction_index]});
+        }
         prediction_index += 1;
     }
 }
@@ -3316,6 +3319,7 @@ pub const Fxcm = struct {
 
     pub fn predict(self: *Fxcm, lstmpr_val: i32, lstmex_val: i32) f32 {
         _ = self;
+        resetPredictions();
         wrtcxt = deccode;
         mxA[8].cxt = @intCast(deccode);
 
@@ -3450,7 +3454,18 @@ pub const Fxcm = struct {
         x.mxInputs2.add(@intCast(@divTrunc(stretch(@intCast(lstmpr_val)), 2)));
         prediction_index -= 1;
 
-        return @as(f32, @floatFromInt(squash((mxA[10].p1() * 7 + mxA[11].p1() + 4) >> 3))) * (1.0 / 4095.0);
+        const final_p = @as(f32, @floatFromInt(squash((mxA[10].p1() * 7 + mxA[11].p1() + 4) >> 3))) * (1.0 / 4095.0);
+
+        if (x.blpos < 5 and x.bpos == 0) {
+            std.debug.print("[DEBUG FXCM] predict. prediction_index={d}, final_p={d:.4}, first_pred={d:.4}, last_pred={d:.4}\n", .{
+                prediction_index,
+                final_p,
+                model_predictions[0],
+                model_predictions[430],
+            });
+        }
+
+        return final_p;
     }
 
     pub fn perceive(self: *Fxcm, bit: u1, lstmpr_val: i32, lstmex_val: i32) void {
