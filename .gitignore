@@ -1,0 +1,5 @@
+*.temp
+*.bak
+*.log
+zig-out/
+.zig-cache/
