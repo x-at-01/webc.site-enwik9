@@ -29,47 +29,30 @@ def main():
     # Append final offset for end boundary of last word
     offsets.append(current_offset)
 
+    import struct
+
+    # Write offsets as binary file
+    offsets_bin_path = "/Users/z/git/test/compress/zig/src/word_offsets.bin"
+    with open(offsets_bin_path, "wb") as f_offsets:
+        for o in offsets:
+            f_offsets.write(struct.pack("<I", o))
+    print(f"Wrote {len(offsets)*4} bytes to {offsets_bin_path}")
+
+    # Write words data as binary file
+    total_data = b"".join(w + b"\x00" for w in packed_words)
+    words_data_bin_path = "/Users/z/git/test/compress/zig/src/words_data.bin"
+    with open(words_data_bin_path, "wb") as f_data:
+        f_data.write(total_data)
+    print(f"Wrote {len(total_data)} bytes to {words_data_bin_path}")
+
     # Now write the Zig code
     with open(out_path, "w", encoding="utf-8") as f:
-        f.write("// Generated dictionary file. Do not edit.\n\n")
+        f.write("// Generated dictionary file. Do not edit.\n")
+        f.write("const std = @import(\"std\");\n\n")
         f.write("pub const word_count: usize = {};\n\n".format(len(words)))
-        
-        # Write offsets array
-        f.write("pub const word_offsets = [_]u32{\n")
-        for i, o in enumerate(offsets):
-            f.write("    {},\n".format(o))
-        f.write("};\n\n")
-        
-        # Write packed words data as a single string literal
-        f.write("pub const words_data = \n")
-        # Split data into readable chunks/lines for Zig compiler safety
-        chunk_size = 80
-        total_data = b"".join(w + b"\x00" for w in packed_words)
-        
-        i = 0
-        while i < len(total_data):
-            chunk = total_data[i:i+chunk_size]
-            # Format chunk as escaped string
-            escaped = ""
-            for b in chunk:
-                if b == 0:
-                    escaped += "\\x00"
-                elif b == ord('\\'):
-                    escaped += "\\\\"
-                elif b == ord('"'):
-                    escaped += "\\\""
-                elif 32 <= b <= 126:
-                    escaped += chr(b)
-                else:
-                    escaped += "\\x{:02x}".format(b)
-            if i > 0:
-                f.write('    ++ "{}"\n'.format(escaped))
-            else:
-                f.write('    "{}"\n'.format(escaped))
-            i += chunk_size
-        f.write(";\n\n")
-        
-        # Write helper function to get word
+        f.write("const offsets_raw align(@alignOf(u32)) = @embedFile(\"word_offsets.bin\").*;\n")
+        f.write("pub const word_offsets = std.mem.bytesAsSlice(u32, &offsets_raw);\n\n")
+        f.write("pub const words_data = @embedFile(\"words_data.bin\");\n\n")
         f.write(
             """pub fn getWord(index: usize) []const u8 {
     if (index >= word_count) return "";

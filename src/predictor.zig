@@ -394,21 +394,34 @@ pub const Predictor = struct {
         }
         for (self.model_predictions[0..53], 0..) |p, i| {
             if (std.math.isNan(p)) {
-                std.debug.panic("model_predictions[{d}] (base models) is NaN\n", .{i});
+                std.debug.print("PANIC: model_predictions[{d}] (base models) is NaN: {d}\n", .{i, p});
+                std.process.exit(1);
             }
         }
 
         self.model_predictions[53] = self.ppm.predict_bit(bc);
-        if (std.math.isNan(self.model_predictions[53])) std.debug.panic("model_predictions[53] (ppm) is NaN\n", .{});
+        if (std.math.isNan(self.model_predictions[53])) {
+            std.debug.print("PANIC: model_predictions[53] (ppm) is NaN. bc={d}, tree[1]={d}\n", .{bc, self.ppm.tree[1]});
+            std.process.exit(1);
+        }
 
         self.model_predictions[54] = self.bracket.predict();
-        if (std.math.isNan(self.model_predictions[54])) std.debug.panic("model_predictions[54] (bracket) is NaN\n", .{});
+        if (std.math.isNan(self.model_predictions[54])) {
+            std.debug.print("PANIC: model_predictions[54] (bracket) is NaN. top={d}, bot={d}\n", .{self.bracket.top, self.bracket.bot});
+            std.process.exit(1);
+        }
 
         self.model_predictions[55] = self.predict_lstm_bit(bc);
-        if (std.math.isNan(self.model_predictions[55])) std.debug.panic("model_predictions[55] (lstm) is NaN\n", .{});
+        if (std.math.isNan(self.model_predictions[55])) {
+            std.debug.print("PANIC: model_predictions[55] (lstm) is NaN. bc={d}, tree[1]={d}, tree[3]={d}\n", .{bc, self.byte_mixer_tree[1], self.byte_mixer_tree[3]});
+            std.process.exit(1);
+        }
 
         self.model_predictions[56] = self.direct_bracket_model.predict(bc);
-        if (std.math.isNan(self.model_predictions[56])) std.debug.panic("model_predictions[56] (direct_bracket) is NaN\n", .{});
+        if (std.math.isNan(self.model_predictions[56])) {
+            std.debug.print("PANIC: model_predictions[56] (direct_bracket) is NaN. bc={d}\n", .{bc});
+            std.process.exit(1);
+        }
 
         // Feed FXCM predictions
         const lstm = self.getLstmprLstmex();
@@ -416,7 +429,8 @@ pub const Predictor = struct {
         @memcpy(self.model_predictions[57..488], &fxcm.model_predictions);
         for (self.model_predictions[57..488], 57..) |p, i| {
             if (std.math.isNan(p)) {
-                std.debug.panic("model_predictions[{d}] (fxcm) is NaN\n", .{i});
+                std.debug.print("PANIC: model_predictions[{d}] (fxcm) is NaN: {d}\n", .{i, p});
+                std.process.exit(1);
             }
         }
 
