@@ -182,7 +182,7 @@ pub const Predictor = struct {
     byte_mixer_probs: [256]f32 = .{0.0} ** 256,
     byte_mixer_tree: [512]f32 = .{1.0} ** 512,
 
-    pub fn init(allocator: std.mem.Allocator, vocab: [256]bool) !Predictor {
+    pub fn init(allocator: std.mem.Allocator, vocab: [256]bool) !*Predictor {
         const shared_map = try allocator.alloc(u8, 256 * 1000000); // 256 MB
         @memset(shared_map, 0);
 
@@ -237,7 +237,10 @@ pub const Predictor = struct {
 
         const lstm_model = try Lstm.init(allocator, vocab_size, vocab_size, 200, 128, 0.03, 10.0, random);
 
-        var self = Predictor{
+        const self = try allocator.create(Predictor);
+        errdefer allocator.destroy(self);
+
+        self.* = Predictor{
             .vocab = vocab,
             .is_possible = is_possible,
             .shared_map = shared_map,
@@ -263,6 +266,8 @@ pub const Predictor = struct {
             .lstm = lstm_model,
             .byte_map = byte_map,
             .byte_mixer_inputs = byte_mixer_inputs,
+            .byte_mixer_probs = [_]f32{0.0} ** 256,
+            .byte_mixer_tree = [_]f32{1.0} ** 512,
         };
 
         // Initialize array models using comptime configs
@@ -297,8 +302,6 @@ pub const Predictor = struct {
         // Layer 1 Mixer: mixes 23 mixers + 488 base models = 511 inputs
         self.mixer_l1 = try Mixer.init(allocator, 1, 511, 0.0005);
 
-        self.byteUpdate();
-
         return self;
     }
 
@@ -327,6 +330,7 @@ pub const Predictor = struct {
             l.deinit(allocator);
         }
         allocator.free(self.byte_mixer_inputs);
+        allocator.destroy(self);
     }
 
     inline fn getLstmprLstmex(self: *const Predictor) struct { pr: i32, ex: i32 } {
@@ -346,6 +350,7 @@ pub const Predictor = struct {
         }
 
         const lstmpr_float = self.predict_lstm_bit(bc);
+        std.debug.print("[DEBUG PREDICT] bc={d}, lstmpr_float={d}, tree[1]={d}, tree[3]={d}\n", .{bc, lstmpr_float, self.byte_mixer_tree[1], self.byte_mixer_tree[3]});
         const lstmpr: i32 = @intFromFloat(1.0 + 4094.0 * lstmpr_float);
 
         return .{ .pr = lstmpr, .ex = lstmex };
@@ -387,19 +392,40 @@ pub const Predictor = struct {
                 }
             }
         }
+        for (self.model_predictions[0..53], 0..) |p, i| {
+            if (std.math.isNan(p)) {
+                std.debug.panic("model_predictions[{d}] (base models) is NaN\n", .{i});
+            }
+        }
+
         self.model_predictions[53] = self.ppm.predict_bit(bc);
+        if (std.math.isNan(self.model_predictions[53])) std.debug.panic("model_predictions[53] (ppm) is NaN\n", .{});
+
         self.model_predictions[54] = self.bracket.predict();
+        if (std.math.isNan(self.model_predictions[54])) std.debug.panic("model_predictions[54] (bracket) is NaN\n", .{});
+
         self.model_predictions[55] = self.predict_lstm_bit(bc);
+        if (std.math.isNan(self.model_predictions[55])) std.debug.panic("model_predictions[55] (lstm) is NaN\n", .{});
+
         self.model_predictions[56] = self.direct_bracket_model.predict(bc);
+        if (std.math.isNan(self.model_predictions[56])) std.debug.panic("model_predictions[56] (direct_bracket) is NaN\n", .{});
 
         // Feed FXCM predictions
         const lstm = self.getLstmprLstmex();
         _ = self.fxcm.predict(lstm.pr, lstm.ex);
         @memcpy(self.model_predictions[57..488], &fxcm.model_predictions);
+        for (self.model_predictions[57..488], 57..) |p, i| {
+            if (std.math.isNan(p)) {
+                std.debug.panic("model_predictions[{d}] (fxcm) is NaN\n", .{i});
+            }
+        }
 
         // 2. Convert to logit domain
-        for (&self.inputs, self.model_predictions) |*input, p| {
+        for (&self.inputs, self.model_predictions, 0..) |*input, p, i| {
             input.* = logit(p);
+            if (std.math.isNan(input.*)) {
+                std.debug.panic("inputs[{d}] is NaN (p={d})\n", .{i, p});
+            }
         }
 
         // 3. Compute Mixer contexts and mix
@@ -452,11 +478,14 @@ pub const Predictor = struct {
         self.mixers[22].selectContext(self.mx15);
 
         // Mix at stage 1 (mixing 488 input models + i extra inputs)
-        for (&self.first_stage_logits, &self.mixers, 0..) |*logit_val, *m, i| {
+        for (&self.first_stage_logits, &self.mixers, 0..) |*logit_val, m, i| {
             var mixer_inputs: [510]f32 = undefined;
             @memcpy(mixer_inputs[0..488], &self.inputs);
             @memcpy(mixer_inputs[488 .. 488 + i], self.first_stage_logits[0..i]);
             logit_val.* = m.mix(mixer_inputs[0 .. 488 + i]);
+            if (std.math.isNan(logit_val.*)) {
+                std.debug.panic("first_stage_logits[{d}] is NaN\n", .{i});
+            }
         }
 
         // Layer 1 inputs setup: 23 first stage logits + 488 base model inputs = 511 inputs
@@ -466,7 +495,13 @@ pub const Predictor = struct {
         // Layer 1 Mix
         self.mixer_l1.selectContext(0);
         self.final_l1_logit = self.mixer_l1.mix(&self.first_stage_outputs);
+        if (std.math.isNan(self.final_l1_logit)) {
+            std.debug.panic("final_l1_logit is NaN\n", .{});
+        }
         self.p_l1 = logistic(self.final_l1_logit);
+        if (std.math.isNan(self.p_l1)) {
+            std.debug.panic("p_l1 is NaN\n", .{});
+        }
 
         return self.sse.predict(self.p_l1);
     }
@@ -789,32 +824,30 @@ pub const Predictor = struct {
         self.bracket.byteUpdate(byte_val);
 
         if (self.lstm) |*lstm| {
-            if (self.bit_context >= 256) {
-                var offset_idx: usize = 0;
-                for (0..256) |j| {
-                    if (self.vocab[j]) {
-                        self.byte_mixer_inputs[offset_idx] = self.ppm.tree[256 + j] * 2.0;
-                        offset_idx += 1;
-                    }
+            var offset_idx: usize = 0;
+            for (0..256) |j| {
+                if (self.vocab[j]) {
+                    self.byte_mixer_inputs[offset_idx] = self.ppm.tree[256 + j] * 2.0;
+                    offset_idx += 1;
                 }
-                lstm.setInput(self.byte_mixer_inputs);
-                const output = lstm.perceive(self.byte_map[byte_val]);
-                offset_idx = 0;
-                for (0..256) |j| {
-                    if (self.vocab[j]) {
-                        self.byte_mixer_probs[j] = output[offset_idx];
-                        offset_idx += 1;
-                    } else {
-                        self.byte_mixer_probs[j] = 0.0;
-                    }
+            }
+            lstm.setInput(self.byte_mixer_inputs);
+            const output = lstm.perceive(self.byte_map[byte_val]);
+            offset_idx = 0;
+            for (0..256) |j| {
+                if (self.vocab[j]) {
+                    self.byte_mixer_probs[j] = output[offset_idx];
+                    offset_idx += 1;
+                } else {
+                    self.byte_mixer_probs[j] = 0.0;
                 }
-                for (0..256) |j| {
-                    self.byte_mixer_tree[256 + j] = self.byte_mixer_probs[j];
-                }
-                var idx: usize = 255;
-                while (idx >= 1) : (idx -= 1) {
-                    self.byte_mixer_tree[idx] = self.byte_mixer_tree[2 * idx] + self.byte_mixer_tree[2 * idx + 1];
-                }
+            }
+            for (0..256) |j| {
+                self.byte_mixer_tree[256 + j] = self.byte_mixer_probs[j];
+            }
+            var idx: usize = 255;
+            while (idx >= 1) : (idx -= 1) {
+                self.byte_mixer_tree[idx] = self.byte_mixer_tree[2 * idx] + self.byte_mixer_tree[2 * idx + 1];
             }
         }
     }

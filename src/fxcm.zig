@@ -14,7 +14,11 @@ pub fn addPrediction(x_val: i32) void {
     if (prediction_index < 431) {
         model_predictions[prediction_index] = @as(f32, @floatFromInt(x_val)) * (1.0 / 4095.0);
         if (x.blpos == 0) {
-            std.debug.print("[DEBUG addPrediction] index={d}, val={d}, float={d:.4}\n", .{prediction_index, x_val, model_predictions[prediction_index]});
+            std.debug.print("[DEBUG addPrediction] index={d}, val={d}, float={d:.4}, blpos={d}\n", .{prediction_index, x_val, model_predictions[prediction_index], x.blpos});
+        } else {
+            if (prediction_index == 0) {
+                std.debug.print("[DEBUG addPrediction idx0] blpos={d}\n", .{x.blpos});
+            }
         }
         prediction_index += 1;
     }
@@ -203,7 +207,7 @@ pub const StateTable = struct {
                 const xx = i - yy;
                 const n = self.num_states(xx, yy);
                 if (n != 0) {
-                    self.t[@intCast(xx)][@intCast(yy)][0] = @intCast(state);
+                    self.t[@intCast(xx)][@intCast(yy)][0] = @intCast(state & 0xff);
                     self.t[@intCast(xx)][@intCast(yy)][1] = @intCast(n);
                     state += n;
                 }
@@ -226,7 +230,7 @@ pub const StateTable = struct {
                     self.next_state(&x0, &y0, 0);
                     self.next_state(&x1, &y1, 1);
                     const ns0 = self.t[@intCast(x0)][@intCast(y0)][0];
-                    const ns1 = self.t[@intCast(x1)][@intCast(y1)][0] + if (self.t[@intCast(x1)][@intCast(y1)][1] > 1) @as(u8, 1) else @as(u8, 0);
+                    const ns1 = self.t[@intCast(x1)][@intCast(y1)][0] +% if (self.t[@intCast(x1)][@intCast(y1)][1] > 1) @as(u8, 1) else @as(u8, 0);
                     self.ns[@intCast(state * 4)] = ns0;
                     self.ns[@intCast(state * 4 + 1)] = ns1;
                     self.ns[@intCast(state * 4 + 2)] = @intCast(xx);
@@ -820,9 +824,9 @@ pub fn GenericContextMap(comptime E_type: type, comptime shift_val: u5) type {
                 try s.init_map(allocator, 256, nn1);
             }
 
-            for (self.cp0[0..self.C]) |*p| p.* = self.t[0].bh[0][0..].ptr;
-            for (self.cp[0..self.C]) |*p| p.* = self.t[0].bh[0][0..].ptr;
-            for (self.runp[0..self.C]) |*p| p.* = self.t[0].bh[0][3..].ptr;
+            for (self.cp0[0..self.C]) |*p| p.* = (&self.t[0]).bh[0][0..].ptr;
+            for (self.cp[0..self.C]) |*p| p.* = (&self.t[0]).bh[0][0..].ptr;
+            for (self.runp[0..self.C]) |*p| p.* = (&self.t[0]).bh[0][3..].ptr;
 
             var rc: usize = 0;
             while (rc < 256) : (rc += 1) {
@@ -933,26 +937,26 @@ pub fn GenericContextMap(comptime E_type: type, comptime shift_val: u5) type {
                         if (bp != 0) {
                             if (bp == 2 or bp == 5) {
                                 const idx = (self.cxt[i] +% @as(u32, @intCast(cc))) & self.tmask;
-                                self.cp0[i] = @ptrCast(self.t[idx].get(chksum, self.kep));
+                                self.cp0[i] = @ptrCast((&self.t[idx]).get(chksum, self.kep));
                                 self.cp[i] = self.cp0[i];
                             } else {
                                 self.cp[i] = self.cp0[i].? + getStateByteLocation(bp, cc);
                             }
                         } else {
                             const idx = (self.cxt[i] +% @as(u32, @intCast(cc))) & self.tmask;
-                            self.cp0[i] = @ptrCast(self.t[idx].get(chksum, self.kep));
+                            self.cp0[i] = @ptrCast((&self.t[idx]).get(chksum, self.kep));
                             self.cp[i] = self.cp0[i];
 
                             if (self.cp0[i].?[3] == 2) {
                                 const c_val = @as(u32, self.cp0[i].?[4]) + 256;
                                 const idx1 = (self.cxt[i] +% (c_val >> 6)) & self.tmask;
-                                var p: [*]u8 = @ptrCast(self.t[idx1].get(chksum, self.kep));
+                                var p: [*]u8 = @ptrCast((&self.t[idx1]).get(chksum, self.kep));
                                 p[0] = @intCast(1 + ((c_val >> 5) & 1));
                                 p[@intCast(1 + ((c_val >> 5) & 1))] = @intCast(1 + ((c_val >> 4) & 1));
                                 p[@intCast(3 + ((c_val >> 4) & 3))] = @intCast(1 + ((c_val >> 3) & 1));
 
                                 const idx2 = (self.cxt[i] +% (c_val >> 3)) & self.tmask;
-                                p = @ptrCast(self.t[idx2].get(chksum, self.kep));
+                                p = @ptrCast((&self.t[idx2]).get(chksum, self.kep));
                                 p[0] = @intCast(1 + ((c_val >> 2) & 1));
                                 p[@intCast(1 + ((c_val >> 2) & 1))] = @intCast(1 + ((c_val >> 1) & 1));
                                 p[@intCast(3 + ((c_val >> 1) & 3))] = @intCast(1 + (c_val & 1));
