@@ -611,7 +611,11 @@ pub const Predictor = struct {
             return std.math.nan(f32);
         }
 
-        return self.sse.predict(self.p_l1);
+        const p = self.sse.predict(self.p_l1);
+        if (self.byte_mixer_output == 0.0 or self.byte_mixer_output == 1.0) {
+            return self.byte_mixer_output;
+        }
+        return p;
     }
 
     pub fn perceive(self: *Predictor, bit: u1) void {

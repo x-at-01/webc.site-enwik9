@@ -34,10 +34,21 @@ pub fn main(init: std.process.Init) !void {
 fn compressFile(io: std.Io, allocator: std.mem.Allocator, input_path: []const u8, output_path: []const u8) !void {
     const input_file = try std.Io.Dir.openFileAbsolute(io, input_path, .{});
     defer input_file.close(io);
-    const file_len = try input_file.length(io);
+    const original_file_len = try input_file.length(io);
+    const raw_data = try allocator.alloc(u8, original_file_len);
+    defer allocator.free(raw_data);
+    _ = try input_file.readPositionalAll(io, raw_data, 0);
+
+    // Prepend 5-byte segment header matching C++ NoPreprocess
+    const file_len = original_file_len + 5;
     const input_data = try allocator.alloc(u8, file_len);
     defer allocator.free(input_data);
-    _ = try input_file.readPositionalAll(io, input_data, 0);
+    input_data[0] = 0; // DEFAULT
+    input_data[1] = @intCast((original_file_len >> 24) & 0xff);
+    input_data[2] = @intCast((original_file_len >> 16) & 0xff);
+    input_data[3] = @intCast((original_file_len >> 8) & 0xff);
+    input_data[4] = @intCast(original_file_len & 0xff);
+    @memcpy(input_data[5..], raw_data);
 
     var vocab = [_]bool{true} ** 256;
     if (file_len >= 10000) {
@@ -91,11 +102,7 @@ fn compressFile(io: std.Io, allocator: std.mem.Allocator, input_path: []const u8
                 std.process.exit(1);
             }
 
-            const pos0 = pred.is_possible[2 * pred.bit_context];
-            const pos1 = pred.is_possible[2 * pred.bit_context + 1];
-            if (pos0 and pos1) {
-                try encoder.encode(allocator, bit, p);
-            }
+            try encoder.encode(allocator, bit, p);
 
             pred.perceive(bit);
             if (shift == 0) break;
@@ -163,14 +170,7 @@ fn decompressFile(io: std.Io, allocator: std.mem.Allocator, input_path: []const 
         while (true) {
             const p = pred.predict();
 
-            const pos0 = pred.is_possible[2 * pred.bit_context];
-            const pos1 = pred.is_possible[2 * pred.bit_context + 1];
-            var bit: u1 = undefined;
-            if (pos0 and pos1) {
-                bit = decoder.decode(p);
-            } else {
-                bit = if (pos1) 1 else 0;
-            }
+            const bit = decoder.decode(p);
 
             pred.perceive(bit);
             byte |= (@as(u8, bit) << bit_idx);
@@ -180,7 +180,32 @@ fn decompressFile(io: std.Io, allocator: std.mem.Allocator, input_path: []const 
         out_buf[pos] = byte;
     }
 
+    // out_buf contains the preprocessed stream of size `total_bytes`.
+    // Parse segments to extract original data.
+    var original_data: std.ArrayList(u8) = .empty;
+    defer original_data.deinit(allocator);
+
+    var offset: usize = 0;
+    while (offset < total_bytes) {
+        if (offset + 5 > total_bytes) {
+            return error.InvalidFile;
+        }
+        const segment_type = out_buf[offset];
+        if (segment_type != 0) {
+            return error.InvalidFile; // Only DEFAULT segments supported
+        }
+        const segment_len = (@as(usize, out_buf[offset + 1]) << 24) |
+                            (@as(usize, out_buf[offset + 2]) << 16) |
+                            (@as(usize, out_buf[offset + 3]) << 8) |
+                            @as(usize, out_buf[offset + 4]);
+        if (offset + 5 + segment_len > total_bytes) {
+            return error.InvalidFile;
+        }
+        try original_data.appendSlice(allocator, out_buf[offset + 5 .. offset + 5 + segment_len]);
+        offset += 5 + segment_len;
+    }
+
     const output_file = try std.Io.Dir.createFileAbsolute(io, output_path, .{});
     defer output_file.close(io);
-    try output_file.writePositionalAll(io, out_buf, 0);
+    try output_file.writePositionalAll(io, original_data.items, 0);
 }

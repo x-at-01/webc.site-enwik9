@@ -18,7 +18,13 @@ pub const Encoder = struct {
         return 1 + @as(u32, @intFromFloat(65534.0 * cp));
     }
 
+var bit_count: usize = 0;
+
     pub fn encode(self: *Encoder, allocator: std.mem.Allocator, bit: u1, p_val: f32) !void {
+        if (bit_count < 1000) {
+            std.debug.print("PRED: {d}: {d:.9} (bit={d})\n", .{ bit_count, p_val, bit });
+            bit_count += 1;
+        }
         const p = discretize(p_val);
         const diff = self.x2 - self.x1;
         const xmid = self.x1 + (diff >> 16) * p + ((diff & 0xffff) * p >> 16);
