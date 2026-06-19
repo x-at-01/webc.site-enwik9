@@ -73,8 +73,9 @@ fn compressFile(io: std.Io, allocator: std.mem.Allocator, input_path: []const u8
     }
 
     const total_bytes = input_data.len;
+    const progress_interval = @max(1, total_bytes / 100);
     for (input_data, 0..) |byte, pos| {
-        if (pos % 100000 == 0) {
+        if (pos % progress_interval == 0) {
             std.debug.print("compress progress: {d:.2}%\n", .{@as(f64, @floatFromInt(pos)) * 100.0 / @as(f64, @floatFromInt(total_bytes))});
         }
         var shift: u3 = 7;
@@ -152,8 +153,9 @@ fn decompressFile(io: std.Io, allocator: std.mem.Allocator, input_path: []const 
     const out_buf = try allocator.alloc(u8, total_bytes);
     defer allocator.free(out_buf);
 
+    const progress_interval = @max(1, total_bytes / 100);
     for (0..total_bytes) |pos| {
-        if (pos % 100000 == 0) {
+        if (pos % progress_interval == 0) {
             std.debug.print("decompress progress: {d:.2}%\n", .{@as(f64, @floatFromInt(pos)) * 100.0 / @as(f64, @floatFromInt(total_bytes))});
         }
         var byte: u8 = 0;

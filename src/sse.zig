@@ -65,7 +65,7 @@ fn st_i(p: u32) u32 {
     const st_coef = (hSCALE - 1.0) / (@log(SCALE - 1.0) * 1.4426950408889634);
     const p_f = @as(f64, @floatFromInt(p));
     const val = st(p_f / SCALE) * st_coef + hSCALE;
-    return @intFromFloat(@round(val));
+    return @intFromFloat(val);
 }
 
 fn sq_i(p: u32) u32 {
@@ -75,7 +75,7 @@ fn sq_i(p: u32) u32 {
     const sq_coef = 1.0 / st_coef;
     const p_f = @as(f64, @floatFromInt(p));
     const val = sq((p_f - hSCALE) * sq_coef) * SCALE;
-    return @intFromFloat(@round(val));
+    return @intFromFloat(val);
 }
 
 inline fn Extrap(p1: i32, C: i32) i32 {

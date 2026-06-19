@@ -1,5 +1,26 @@
 const std = @import("std");
 
+pub const ParkMillerLcg = struct {
+    state: u32,
+
+    pub fn init(seed: u32) ParkMillerLcg {
+        return .{ .state = seed };
+    }
+
+    pub fn next(self: *ParkMillerLcg) u32 {
+        const a: u64 = 16807;
+        const m: u64 = 2147483647;
+        const next_state = (self.state *% a) % m;
+        self.state = @intCast(next_state);
+        return self.state;
+    }
+
+    pub fn nextFloat(self: *ParkMillerLcg) f32 {
+        const val = self.next();
+        return @as(f32, @floatFromInt(val)) / 2147483647.0;
+    }
+};
+
 pub inline fn logistic(x: f32) f32 {
     return 1.0 / (1.0 + @exp(-x));
 }
@@ -125,7 +146,7 @@ pub const LstmLayer = struct {
     input_node: NeuronLayer,
     output_gate: NeuronLayer,
 
-    pub fn init(allocator: std.mem.Allocator, input_size: usize, auxiliary_input_size: usize, output_size: usize, num_cells: usize, horizon: usize, gradient_clip: f32, learning_rate: f32, random: std.Random) !LstmLayer {
+    pub fn init(allocator: std.mem.Allocator, input_size: usize, auxiliary_input_size: usize, output_size: usize, num_cells: usize, horizon: usize, gradient_clip: f32, learning_rate: f32, lcg: *ParkMillerLcg) !LstmLayer {
         const state = try allocator.alloc(f32, num_cells);
         @memset(state, 0.0);
         const state_error = try allocator.alloc(f32, num_cells);
@@ -150,9 +171,9 @@ pub const LstmLayer = struct {
 
         for (0..num_cells) |i| {
             for (0..input_size) |j| {
-                forget_gate.weights[i * input_size + j] = low + random.float(f32) * range;
-                input_node.weights[i * input_size + j] = low + random.float(f32) * range;
-                output_gate.weights[i * input_size + j] = low + random.float(f32) * range;
+                forget_gate.weights[i * input_size + j] = low + lcg.nextFloat() * range;
+                input_node.weights[i * input_size + j] = low + lcg.nextFloat() * range;
+                output_gate.weights[i * input_size + j] = low + lcg.nextFloat() * range;
             }
             forget_gate.weights[i * input_size + input_size - 1] = 1.0;
         }
@@ -191,10 +212,17 @@ pub const LstmLayer = struct {
     fn forwardPassLayer(self: *LstmLayer, neurons: *NeuronLayer, input: []const f32, input_symbol: usize) void {
         const offset = self.output_size + self.input_size;
         const row_size = offset + self.num_cells + 1;
+        var local_input: [512]f32 = undefined;
+        const len = input.len;
+        @memcpy(local_input[0..len], input);
+        const in_ptr = &local_input;
+
         for (0..self.num_cells) |i| {
             var f = neurons.weights[i * row_size + input_symbol];
-            for (input, 0..) |inp_val, j| {
-                f += inp_val * neurons.weights[i * row_size + self.output_size + j];
+            const weight_offset = i * row_size + self.output_size;
+            const w_slice = neurons.weights[weight_offset .. weight_offset + len];
+            for (in_ptr[0..len], w_slice) |inp_val, w_val| {
+                f += inp_val * w_val;
             }
             neurons.norm[self.epoch * self.num_cells + i] = f;
         }
@@ -290,19 +318,29 @@ pub const LstmLayer = struct {
         if (epoch > 0) {
             for (0..self.num_cells) |i| {
                 var f: f32 = 0.0;
-                for (0..self.num_cells) |j| {
-                    f += neurons.error_grad[j] * neurons.transpose[i * self.num_cells + j];
+                const transpose_offset = i * self.num_cells;
+                const trans_slice = neurons.transpose[transpose_offset .. transpose_offset + self.num_cells];
+                for (neurons.error_grad, trans_slice) |err_val, t_val| {
+                    f += err_val * t_val;
                 }
                 hidden_error[i] += f;
             }
         }
 
+        var local_input: [512]f32 = undefined;
+        const len = input.len;
+        @memcpy(local_input[0..len], input);
+        const in_ptr = &local_input;
+
         for (0..self.num_cells) |i| {
             const w_row = i * row_size;
-            for (input, 0..) |inp_val, j| {
-                neurons.update[w_row + self.output_size + j] += neurons.error_grad[i] * inp_val;
+            const err_grad = neurons.error_grad[i];
+            const update_offset = w_row + self.output_size;
+            const update_slice = neurons.update[update_offset .. update_offset + len];
+            for (update_slice, in_ptr[0..len]) |*u_val, inp_val| {
+                u_val.* += err_grad * inp_val;
             }
-            neurons.update[w_row + input_symbol] += neurons.error_grad[i];
+            neurons.update[w_row + input_symbol] += err_grad;
         }
 
         if (epoch == 0) {
@@ -332,7 +370,7 @@ pub const LstmLayer = struct {
         for (g, m, v, w) |g_val, *m_val, *v_val, *w_val| {
             m_val.* = m_val.* * beta1 + (1.0 - beta1) * g_val;
             v_val.* = v_val.* * beta2 + (1.0 - beta2) * g_val * g_val;
-            w_val.* -= alpha * ((m_val.* / correction1) / (@sqrt(v_val.* / correction2) + eps));
+            w_val.* -= alpha * ((m_val.* / correction1) / @sqrt(v_val.* / correction2 + eps));
         }
     }
 
@@ -403,8 +441,8 @@ pub const Lstm = struct {
     output_size: usize,
     last_input: i32 = -1,
 
-    pub fn init(allocator: std.mem.Allocator, input_size: usize, output_size: usize, num_cells: usize, horizon: usize, learning_rate: f32, gradient_clip: f32, random: std.Random) !Lstm {
-        const layers = try LstmLayer.init(allocator, input_size + 1 + num_cells + output_size, input_size, output_size, num_cells, horizon, gradient_clip, learning_rate, random);
+    pub fn init(allocator: std.mem.Allocator, input_size: usize, output_size: usize, num_cells: usize, horizon: usize, learning_rate: f32, gradient_clip: f32, lcg: *ParkMillerLcg) !Lstm {
+        const layers = try LstmLayer.init(allocator, input_size + 1 + num_cells + output_size, input_size, output_size, num_cells, horizon, gradient_clip, learning_rate, lcg);
 
         const input_history = try allocator.alloc(u8, horizon);
         @memset(input_history, 0);

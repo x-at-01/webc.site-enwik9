@@ -1,6 +1,8 @@
 const std = @import("std");
 const lstm_mod = @import("lstm.zig");
 const Lstm = lstm_mod.Lstm;
+const ParkMillerLcg = lstm_mod.ParkMillerLcg;
+
 const fxcm = @import("fxcm.zig");
 const Fxcm = fxcm.Fxcm;
 
@@ -10,7 +12,6 @@ const wrt_2b = tables.wrt_2b;
 const wrt_3b = tables.wrt_3b;
 const wrt_4b = tables.wrt_4b;
 const wrt_5b = tables.wrt_5b;
-const run_map_table = tables.run_map_table;
 
 const indirect = @import("indirect.zig");
 const IndirectModel = indirect.IndirectModel;
@@ -36,45 +37,105 @@ const Mixer = mixer.Mixer;
 const direct = @import("direct.zig");
 const DirectModel = direct.DirectModel;
 
-pub inline fn logit(p: f32) f32 {
-    const min_p = 0.0001;
-    const max_p = 0.9999;
-    const cp = if (p < min_p) min_p else if (p > max_p) max_p else p;
-    return @log(cp / (1.0 - cp));
-}
+pub const Sigmoid = struct {
+    logit_table: [100001]f32,
 
-pub inline fn logistic(x: f32) f32 {
-    return 1.0 / (1.0 + @exp(-x));
-}
-
-inline fn hashBytes(bytes: []const u8) u64 {
-    var h: u64 = 0xcbf29ce484222325;
-    for (bytes) |b| {
-        h = (h ^ b) *% 0x100000001b3;
+    pub fn init() Sigmoid {
+        var self: Sigmoid = undefined;
+        var i: usize = 0;
+        while (i < 100001) : (i += 1) {
+            const p = (@as(f32, @floatFromInt(i)) + 0.5) / 100001.0;
+            self.logit_table[i] = std.math.log(f32, std.math.e, p / (1.0 - p));
+        }
+        return self;
     }
-    return h;
-}
 
-const order_deltas = [_]f32{
-    100.0, 150.0, 200.0, 250.0, 300.0, 300.0, 300.0, 350.0,
-    350.0, 350.0, 350.0, 350.0, 350.0, 350.0, 350.0, 350.0,
-    350.0, 400.0, 400.0, 400.0, 400.0, 400.0, 400.0, 400.0,
+    pub fn logit(self: *const Sigmoid, p_val: f32) f32 {
+        var p = p_val;
+        if (p < 1.0e-4) {
+            p = 1.0e-4;
+        } else if (p > 1.0 - 1.0e-4) {
+            p = 1.0 - 1.0e-4;
+        }
+        var index = @as(i32, @intFromFloat(p * 100001.0));
+        if (index >= 100001) {
+            index = 100000;
+        } else if (index < 0) {
+            index = 0;
+        }
+        return self.logit_table[@as(usize, @intCast(index))];
+    }
+    
+    pub fn clampLogit(self: *const Sigmoid, logit_val: f32) f32 {
+        const stretched_min = self.logit(1.0e-4);
+        const stretched_max = self.logit(1.0 - 1.0e-4);
+        if (logit_val > stretched_max) {
+            return stretched_max;
+        } else if (logit_val < stretched_min) {
+            return stretched_min;
+        }
+        return logit_val;
+    }
 };
 
-const sparse_deltas = [_]f32{
-    200.0, 200.0, 200.0, 200.0, 250.0, 250.0, 250.0, 250.0, 250.0, 250.0,
-};
+pub const BracketContext = struct {
+    active: [16]u8 = undefined,
+    distance: [16]u32 = undefined,
+    active_len: usize = 0,
+    distance_limit: u32,
+    stack_limit: u32,
+    context: u64 = 0,
 
-const run_deltas = [_]f32{ 100.0, 150.0, 200.0, 250.0 };
-const double_ind_deltas = [_]f32{400.0} ** 4;
+    pub fn init(distance_limit: u32, stack_limit: u32) BracketContext {
+        return .{
+            .distance_limit = distance_limit,
+            .stack_limit = stack_limit,
+        };
+    }
 
-// Comptime configuration meta for array models
-const model_fields = .{
-    .{ .name = "orders", .offset = 0, .has_map_bc = true },
-    .{ .name = "sparse_models", .offset = 24, .has_map_bc = true },
-    .{ .name = "run_models", .offset = 34, .has_map_bc = true },
-    .{ .name = "match_models", .offset = 38, .has_map_bc = false },
-    .{ .name = "double_indirect_models", .offset = 49, .has_map_bc = true },
+    pub fn update(self: *BracketContext, byte_val: u8) void {
+        const brackets = init_brackets: {
+            var map = [_]u8{0} ** 256;
+            map['('] = ')';
+            map['P'] = 'R';
+            map['['] = ']';
+            map['L'] = 'N';
+            break :init_brackets map;
+        };
+
+        if (self.active_len > 0) {
+            const last_active = self.active[self.active_len - 1];
+            const closing = brackets[last_active];
+            if (closing == byte_val or self.distance[self.active_len - 1] >= self.distance_limit - 1) {
+                self.active_len -= 1;
+            } else {
+                self.distance[self.active_len - 1] += 1;
+            }
+        }
+
+        const is_bracket = (byte_val == '(' or byte_val == 'P' or byte_val == '[' or byte_val == 'L');
+        if (is_bracket) {
+            if (self.active_len < 16) {
+                self.active[self.active_len] = byte_val;
+                self.distance[self.active_len] = 0;
+                self.active_len += 1;
+            }
+            if (self.active_len > self.stack_limit) {
+                var i: usize = 0;
+                while (i < self.active_len - 1) : (i += 1) {
+                    self.active[i] = self.active[i + 1];
+                    self.distance[i] = self.distance[i + 1];
+                }
+                self.active_len -= 1;
+            }
+        }
+
+        if (self.active_len > 0) {
+            self.context = @as(u64, self.distance_limit) *% (@as(u64, self.active[self.active_len - 1]) +% 1) +% self.distance[self.active_len - 1];
+        } else {
+            self.context = 0;
+        }
+    }
 };
 
 pub const Predictor = struct {
@@ -134,6 +195,7 @@ pub const Predictor = struct {
     mx17: u64 = 0,
     mx18: u64 = 0,
     mx18cxt: u64 = 0,
+    mx19cxt: u64 = 0,
     words_state: u64 = 0,
     wordscxt: u64 = 0,
     line_break: u64 = 0,
@@ -142,13 +204,12 @@ pub const Predictor = struct {
     b2streamcxt: u64 = 0,
     b3streamcxt: u64 = 0,
 
-    // Base models grouped into arrays
-    orders: [24]IndirectModel,
-    sparse_models: [10]IndirectModel,
-    run_models: [4]RunMapModel,
-    match_models: [11]MatchModel,
-    double_indirect_models: [4]IndirectModel,
+    // Base models
+    bracket_context: BracketContext,
     direct_bracket_model: DirectModel,
+    match_models: [10]MatchModel,
+    indirect_ns_models: [15]IndirectModel,
+    indirect_r_model: RunMapModel,
 
     // Shelwien SSE model
     sse: ShelwienSSE,
@@ -168,11 +229,14 @@ pub const Predictor = struct {
     // FXCM Model
     fxcm: Fxcm,
 
-    // Cache predictions and logits (increased size to 57 + 431 = 488 for direct_bracket_model + fxcm)
-    model_predictions: [488]f32 = undefined,
-    inputs: [488]f32 = undefined,
+    // Sigmoid Logit table
+    sigmoid: Sigmoid,
+
+    // Cache predictions and logits
+    model_predictions: [461]f32 = undefined,
+    inputs: [461]f32 = undefined,
     first_stage_logits: [23]f32 = undefined,
-    first_stage_outputs: [511]f32 = undefined,
+    first_stage_outputs: [25]f32 = undefined,
     final_l1_logit: f32 = 0.0,
     p_l1: f32 = 0.0,
 
@@ -181,12 +245,15 @@ pub const Predictor = struct {
     byte_mixer_inputs: []f32 = undefined,
     byte_mixer_probs: [256]f32 = .{0.0} ** 256,
     byte_mixer_tree: [512]f32 = .{1.0} ** 512,
+    byte_mixer_output: f32 = 0.0,
+    lstm_pr: i32 = 0,
+    lstm_ex: i32 = 0,
 
     pub fn init(allocator: std.mem.Allocator, vocab: [256]bool) !*Predictor {
-        const shared_map = try allocator.alloc(u8, 256 * 1000000); // 256 MB
+        const shared_map = try allocator.alloc(u8, 256 * 400000); // 102.4 MB (Matches C++ shared_map_ size)
         @memset(shared_map, 0);
 
-        const history = try allocator.alloc(u8, 1000000 + 100);
+        const history = try allocator.alloc(u8, 60000000 + 100); // 60 MB (Matches C++ history_ size)
         @memset(history, 0);
 
         const hashes_ind1 = try allocator.alloc(u8, 0x1000000);
@@ -198,16 +265,7 @@ pub const Predictor = struct {
         const hashes_ind5 = try allocator.alloc(u32, 0x100);
         @memset(hashes_ind5, 0);
 
-        var prng = std.Random.DefaultPrng.init(12345);
-        const random = prng.random();
-
-        const randOffset = struct {
-            fn get(r: std.Random, max: usize) usize {
-                return r.intRangeLessThan(usize, 0, max - 257);
-            }
-        }.get;
-
-        const limit = shared_map.len;
+        const map_limit = shared_map.len - 257;
 
         var is_possible = [_]bool{false} ** 512;
         for (0..256) |i| {
@@ -235,7 +293,30 @@ pub const Predictor = struct {
         const byte_mixer_inputs = try allocator.alloc(f32, vocab_size);
         @memset(byte_mixer_inputs, 0.0);
 
-        const lstm_model = try Lstm.init(allocator, vocab_size, vocab_size, 200, 128, 0.03, 10.0, random);
+        // Initialize deterministic LCG matching C++'s srand(923) sequence
+        var lcg = ParkMillerLcg.init(923);
+
+        // 1. Bracket context NS model
+        var indirect_ns_models: [15]IndirectModel = undefined;
+        indirect_ns_models[0] = IndirectModel.init(lcg.next() % map_limit, 300.0);
+
+        // 2. Word NS models
+        var idx: usize = 0;
+        while (idx < 10) : (idx += 1) {
+            indirect_ns_models[1 + idx] = IndirectModel.init(lcg.next() % map_limit, 200.0);
+        }
+
+        // 3. Word run map model (constructed in same sequence as C++)
+        const indirect_r_model = RunMapModel.init(lcg.next() % map_limit, 200.0);
+
+        // 4. Double indirect NS models
+        idx = 0;
+        while (idx < 4) : (idx += 1) {
+            indirect_ns_models[11 + idx] = IndirectModel.init(lcg.next() % map_limit, 400.0);
+        }
+
+        // 5. LSTM (Constructed after base models, inheriting LCG state)
+        const lstm_model = try Lstm.init(allocator, vocab_size, vocab_size, 200, 128, 0.03, 10.0, &lcg);
 
         const self = try allocator.create(Predictor);
         errdefer allocator.destroy(self);
@@ -292,6 +373,7 @@ pub const Predictor = struct {
             .mx17 = 0,
             .mx18 = 0,
             .mx18cxt = 0,
+            .mx19cxt = 0,
             .words_state = 0,
             .wordscxt = 0,
             .line_break = 0,
@@ -300,12 +382,11 @@ pub const Predictor = struct {
             .b2streamcxt = 0,
             .b3streamcxt = 0,
 
-            .orders = undefined,
-            .sparse_models = undefined,
-            .run_models = undefined,
+            .bracket_context = BracketContext.init(256, 15),
+            .direct_bracket_model = try DirectModel.init(allocator, 65792, 30, 0.0), // Context limit 256 -> Size 65792
             .match_models = undefined,
-            .double_indirect_models = undefined,
-            .direct_bracket_model = try DirectModel.init(allocator, 51400, 30, 0.0),
+            .indirect_ns_models = indirect_ns_models,
+            .indirect_r_model = indirect_r_model,
 
             .sse = undefined,
             .ppm = try PpmModel.init(allocator, vocab),
@@ -318,41 +399,31 @@ pub const Predictor = struct {
             .byte_mixer_inputs = byte_mixer_inputs,
             .byte_mixer_probs = [_]f32{0.0} ** 256,
             .byte_mixer_tree = [_]f32{1.0} ** 512,
+            .byte_mixer_output = 0.0,
+            .lstm_pr = 0,
+            .lstm_ex = 0,
             .final_l1_logit = 0.0,
             .p_l1 = 0.0,
+            .sigmoid = Sigmoid.init(),
         };
 
-        // Initialize array models using comptime configs
-        const init_configs = .{
-            .{ .name = "orders", .Type = IndirectModel, .deltas = &order_deltas },
-            .{ .name = "sparse_models", .Type = IndirectModel, .deltas = &sparse_deltas },
-            .{ .name = "run_models", .Type = RunMapModel, .deltas = &run_deltas },
-            .{ .name = "double_indirect_models", .Type = IndirectModel, .deltas = &double_ind_deltas },
-        };
-        inline for (init_configs) |cfg| {
-            const array = &@field(self, cfg.name);
-            inline for (array, 0..) |*model, i| {
-                model.* = cfg.Type.init(randOffset(random, limit), cfg.deltas[i]);
-            }
-        }
-
-        // Initialize match models
-        inline for (&self.match_models) |*model| {
+        // Initialize Match models (Exactly 10)
+        for (&self.match_models) |*model| {
             model.* = try MatchModel.init(allocator, 2000000, 200, 0.5);
         }
 
-        // Initialize mixers: mixing 488 input models + i extra inputs
+        // Initialize Mixers (23 mixers in stage 0, mixing 461 inputs + i extra inputs)
         const learning_rates = [_]f32{
             0.005, 0.0005, 0.005, 0.0005, 0.005, 0.001, 0.002, 0.0007, 0.0005,
             0.002, 0.0005, 0.001, 0.001,  0.005, 0.001, 0.001, 0.005,  0.001,
             0.001, 0.005,  0.005, 0.005,  0.005,
         };
         for (&self.mixers, 0..) |*mixer_ptr, i| {
-            mixer_ptr.* = try Mixer.init(allocator, 131072, 488 + i, learning_rates[i]);
+            mixer_ptr.* = try Mixer.init(allocator, 461, i, learning_rates[i]);
         }
 
-        // Layer 1 Mixer: mixes 23 mixers + 488 base models = 511 inputs
-        self.mixer_l1 = try Mixer.init(allocator, 1, 511, 0.0005);
+        // Layer 1 Mixer: mixes 25 inputs (23 stage 0 outputs + 2 auxiliary outputs)
+        self.mixer_l1 = try Mixer.init(allocator, 25, 0, 0.0003);
         try self.sse.init(allocator);
 
         return self;
@@ -386,8 +457,7 @@ pub const Predictor = struct {
         allocator.destroy(self);
     }
 
-    inline fn getLstmprLstmex(self: *const Predictor) struct { pr: i32, ex: i32 } {
-        const bc = self.bit_context;
+    inline fn getLstmprLstmexForBc(self: *const Predictor, bc: u32) struct { pr: i32, ex: i32 } {
         const L = 31 - @clz(bc);
         const step = @as(u32, 256) >> @intCast(L);
         const bot = (bc - (@as(u32, 1) << @intCast(L))) * step;
@@ -441,30 +511,38 @@ pub const Predictor = struct {
         const map = self.shared_map;
         const bc = self.bit_context;
 
-        // 1. Gather predictions from base models using comptime config map
-        inline for (model_fields) |field| {
-            const array = &@field(self, field.name);
-            inline for (array, 0..) |*model, i| {
-                if (field.has_map_bc) {
-                    self.model_predictions[field.offset + i] = model.predict(map, bc);
-                } else {
-                    self.model_predictions[field.offset + i] = model.predict();
-                }
-            }
+        // 1. Gather predictions from base models (461 total outputs)
+        self.model_predictions[0] = self.bracket.predict();
+        
+        // FXCM model outputs (431 inputs, index 1..431)
+        _ = self.fxcm.predict(self.lstm_pr, self.lstm_ex);
+        @memcpy(self.model_predictions[1..432], &fxcm.model_predictions);
+
+        // Direct bracket model output (1 input, index 432)
+        self.model_predictions[432] = self.direct_bracket_model.predict(bc);
+
+        // Match models predictions (10 inputs, index 433..442)
+        for (&self.match_models, 0..) |*model, i| {
+            self.model_predictions[433 + i] = model.predict();
         }
-        self.model_predictions[53] = self.ppm.predict_bit(bc);
-        self.model_predictions[54] = self.bracket.predict();
-        self.model_predictions[55] = self.predict_lstm_bit(bc);
-        self.model_predictions[56] = self.direct_bracket_model.predict(bc);
 
-        // Feed FXCM predictions
-        const lstm = self.getLstmprLstmex();
-        _ = self.fxcm.predict(lstm.pr, lstm.ex);
-        @memcpy(self.model_predictions[57..488], &fxcm.model_predictions);
+        // Indirect NS models predictions (15 inputs, index 443..457)
+        for (&self.indirect_ns_models, 0..) |*model, i| {
+            self.model_predictions[443 + i] = model.predict(map, bc);
+        }
 
-        // 2. Convert to logit domain
+        // Indirect R model prediction (1 input, index 458)
+        self.model_predictions[458] = self.indirect_r_model.predict(map, bc);
+
+        // PPM Model prediction (1 input, index 459)
+        self.model_predictions[459] = self.ppm.predict_bit(bc);
+
+        // LSTM prediction (1 input, index 460)
+        self.model_predictions[460] = self.byte_mixer_output;
+
+        // 2. Convert to logit domain using lookup table
         for (&self.inputs, self.model_predictions) |*input, p| {
-            input.* = logit(p);
+            input.* = self.sigmoid.logit(p);
         }
 
         // 3. Compute Mixer contexts and mix
@@ -482,14 +560,11 @@ pub const Predictor = struct {
             mxx = (self.stream2bR & 63) * 8 + (self.b3stream & 7);
         }
 
-        // Proxy for mx19cxt
-        const mx19cxt = 0x10000 + (self.b2stream & 0xffff);
+        const mx19cxt = self.mx19cxt;
 
-        // Proxy for auxiliary_context
-        const p_order3 = self.model_predictions[2];
-        const p_ppm = self.model_predictions[53];
-        const auxiliary_average = (p_order3 + p_ppm) / 2.0;
-        self.auxiliary_context = @as(u64, @intFromFloat(auxiliary_average * 15.0));
+        // Proxy for auxiliary_context using fxcm_model_index (431) and byte_mixer_index (460)
+        const avg = (logistic(self.inputs[431]) + logistic(self.inputs[460])) / 2.0;
+        self.auxiliary_context = @as(u64, @intFromFloat(avg * 15.0));
 
         // Context selections matching C++ structures exactly
         self.mixers[0].selectContext(self.mx9);
@@ -516,21 +591,21 @@ pub const Predictor = struct {
         self.mixers[21].selectContext(self.mx14);
         self.mixers[22].selectContext(self.mx15);
 
-        // Mix at stage 1 (mixing 488 input models + i extra inputs)
-        for (&self.first_stage_logits, &self.mixers, 0..) |*logit_val, m, i| {
-            var mixer_inputs: [510]f32 = undefined;
-            @memcpy(mixer_inputs[0..488], &self.inputs);
-            @memcpy(mixer_inputs[488 .. 488 + i], self.first_stage_logits[0..i]);
-            logit_val.* = m.mix(mixer_inputs[0 .. 488 + i]);
+        // Mix at stage 0 (23 mixers, each mixing 461 inputs + i extra inputs)
+        for (&self.first_stage_logits, &self.mixers, 0..) |*logit_val, *m, i| {
+            logit_val.* = m.mix(&self.inputs, self.first_stage_logits[0..i]);
         }
 
-        // Layer 1 inputs setup: 23 first stage logits + 488 base model inputs = 511 inputs
-        @memcpy(self.first_stage_outputs[0..23], &self.first_stage_logits);
-        @memcpy(self.first_stage_outputs[23..511], &self.inputs);
+        // Layer 1 inputs setup: 23 first stage logits + 2 auxiliary outputs (clamped)
+        for (self.first_stage_logits, 0..) |logit_val, i| {
+            self.first_stage_outputs[i] = self.sigmoid.clampLogit(logit_val);
+        }
+        self.first_stage_outputs[23] = self.sigmoid.clampLogit(self.inputs[431]);
+        self.first_stage_outputs[24] = self.sigmoid.clampLogit(self.inputs[460]);
 
         // Layer 1 Mix
         self.mixer_l1.selectContext(0);
-        self.final_l1_logit = self.mixer_l1.mix(&self.first_stage_outputs);
+        self.final_l1_logit = self.mixer_l1.mix(&self.first_stage_outputs, &.{});
         self.p_l1 = logistic(self.final_l1_logit);
         if (std.math.isNan(self.p_l1)) {
             return std.math.nan(f32);
@@ -540,47 +615,29 @@ pub const Predictor = struct {
     }
 
     pub fn perceive(self: *Predictor, bit: u1) void {
-        const decay = getDecay(self.steps);
-
         // 1. Train Shelwien SSE model
         self.sse.perceive(bit);
 
         // 2. Train Layer 1 mixer
-        self.mixer_l1.perceive(&self.first_stage_outputs, self.final_l1_logit, bit, decay);
+        self.mixer_l1.perceive(&self.first_stage_outputs, &.{}, bit, self.steps);
 
         // 3. Train first-stage mixers
         for (&self.mixers, self.first_stage_logits, 0..) |*m, mixed_logit, i| {
-            var mixer_inputs: [510]f32 = undefined;
-            @memcpy(mixer_inputs[0..488], &self.inputs);
-            @memcpy(mixer_inputs[488 .. 488 + i], self.first_stage_logits[0..i]);
-            m.perceive(mixer_inputs[0 .. 488 + i], mixed_logit, bit, decay);
+            _ = mixed_logit;
+            m.perceive(&self.inputs, self.first_stage_logits[0..i], bit, self.steps);
         }
 
-        // 5. Train base models using comptime config map
+        // 5. Train base models
         const map = self.shared_map;
         const bc = self.bit_context;
 
-        inline for (model_fields) |field| {
-            if (field.has_map_bc) {
-                inline for (&@field(self, field.name)) |*model| {
-                    model.perceive(map, bc, bit);
-                }
-            }
-        }
         self.direct_bracket_model.perceive(bc, bit);
 
-        // Sparse word-based contexts for match models
         const s_0 = self.words[0];
         const s_1 = self.words[1];
         const s_1_3 = self.words[1] +% 256 *% self.words[3];
         const s_1_2_3 = self.words[1] +% 256 *% self.words[2] +% 899 *% self.words[3];
         const s_7_2 = self.words[7] +% 256 *% self.words[2];
-        const c1 = self.getByte(1);
-        const c2 = self.getByte(2);
-        const c3 = self.getByte(3);
-        const o4 = (@as(u64, c1) << 24) | (@as(u64, c2) << 16) | (@as(u64, c3) << 8) | self.getByte(4);
-
-        // Hash contexts for match6 to match10
         const h_0_8 = self.hashHistory(0, 8);
         const h_1_8 = self.hashHistory(1, 8);
         const h_7_4 = self.hashHistory(7, 4);
@@ -593,7 +650,6 @@ pub const Predictor = struct {
             s_1_3,
             s_1_2_3,
             s_7_2,
-            o4,
             h_0_8,
             h_1_8,
             h_7_4,
@@ -604,10 +660,19 @@ pub const Predictor = struct {
             model.perceive(match_contexts[i], bc, bit, self.history_pos);
         }
 
-        self.bracket.perceive(bit);
+        // NS models perceive
+        self.indirect_ns_models[0].perceive(map, bc, bit); // Bracket context
+        inline for (1..11) |i| {
+            self.indirect_ns_models[i].perceive(map, bc, bit); // Word contexts
+        }
+        inline for (11..15) |i| {
+            self.indirect_ns_models[i].perceive(map, bc, bit); // Double indirect contexts
+        }
 
-        const lstm = self.getLstmprLstmex();
-        self.fxcm.perceive(bit, lstm.pr, lstm.ex);
+        // Run map model perceive
+        self.indirect_r_model.perceive(map, bc, bit);
+
+        self.bracket.perceive(bit);
 
         // 6. Update state variables
         self.steps += 1;
@@ -617,9 +682,17 @@ pub const Predictor = struct {
         // Byte Boundary check
         if (self.bit_context >= 256) {
             self.byteUpdate();
+        } else {
+            self.byte_mixer_output = self.predict_lstm_bit(self.bit_context);
+            const lstm = self.getLstmprLstmexForBc(self.bit_context);
+            self.lstm_pr = lstm.pr;
+            self.lstm_ex = lstm.ex;
         }
 
-        // Bit-level context updates (matching C++ long_bit_context_ behavior)
+        self.mx19cxt = fxcm.wrtcxt;
+        self.fxcm.perceive(bit, self.lstm_pr, self.lstm_ex);
+
+        // Bit-level context updates
         const bc_u64 = @as(u64, self.bit_context);
         self.wordscxt = (self.words_state & 0x7F) *% 256 +% bc_u64;
         self.mx6 = (self.stream2bR & 0xff) *% 256 +% bc_u64;
@@ -753,56 +826,27 @@ pub const Predictor = struct {
         }
         self.recent_bytes[0] = byte_val;
 
-        // Context updating for order-K models
-        var orders_ctx: [24]u64 = undefined;
-        const c1: u64 = self.recent_bytes[0];
-        const c2: u64 = self.recent_bytes[1];
-        const c3: u64 = self.recent_bytes[2];
-        const c4: u64 = self.recent_bytes[3];
-
-        orders_ctx[0] = c1;
-        orders_ctx[1] = (c1 << 8) | c2;
-        orders_ctx[2] = (c1 << 16) | (c2 << 8) | c3;
-        orders_ctx[3] = (c1 << 24) | (c2 << 16) | (c3 << 8) | c4;
-
-        inline for (4..24) |i| {
-            orders_ctx[i] = (orders_ctx[i - 1] *% 133) +% self.getByte(i + 1);
-        }
+        // Update BracketContext
+        self.bracket_context.update(byte_val);
 
         const map_len = self.shared_map.len;
 
         // Sparse models contexts updated dynamically
         const s_0 = self.words[0];
-        const s_0_1 = self.words[0] +% 256 *% self.words[1];
         const s_1 = self.words[1];
-        const s_1_2 = self.words[1] +% 256 *% self.words[2];
         const s_1_3 = self.words[1] +% 256 *% self.words[3];
+        const s_0_1 = self.words[0] +% 256 *% self.words[1];
+        const s_1_2 = self.words[1] +% 256 *% self.words[2];
         const s_2_3 = self.words[2] +% 256 *% self.words[3];
         const s_3_4 = self.words[3] +% 256 *% self.words[4];
         const s_1_2_4 = self.words[1] +% 256 *% self.words[2] +% 899 *% self.words[4];
         const s_2_3_4 = self.words[2] +% 256 *% self.words[3] +% 899 *% self.words[4];
         const s_2 = self.words[2];
+
+        // Match contexts
         const s_1_2_3 = self.words[1] +% 256 *% self.words[2] +% 899 *% self.words[3];
         const s_7_2 = self.words[7] +% 256 *% self.words[2];
 
-        const sparse_ctx = .{
-            s_0,
-            s_0_1,
-            s_1,
-            s_1_2,
-            s_1_3,
-            s_2_3,
-            s_3_4,
-            s_1_2_4,
-            s_2_3_4,
-            s_2,
-        };
-
-        const run_ctx = .{ s_1, s_2, s_1_3, s_1_2_3 };
-
-        const history_slice = self.history[0..self.history_pos];
-
-        // Hash contexts for match6 to match10
         const h_0_8 = self.hashHistory(0, 8);
         const h_1_8 = self.hashHistory(1, 8);
         const h_7_4 = self.hashHistory(7, 4);
@@ -815,7 +859,6 @@ pub const Predictor = struct {
             s_1_3,
             s_1_2_3,
             s_7_2,
-            orders_ctx[3], // o4
             h_0_8,
             h_1_8,
             h_7_4,
@@ -823,29 +866,44 @@ pub const Predictor = struct {
             h_13_2,
         };
 
-        const double_ind_ctx = .{ self.ind1, self.ind2, self.ind3, self.ind5 };
+        const history_slice = self.history[0..self.history_pos];
 
-        // Unified byte update loop utilizing comptime update config
-        const update_configs = .{
-            .{ .name = "orders", .ctxs = orders_ctx, .use_map = true },
-            .{ .name = "sparse_models", .ctxs = sparse_ctx, .use_map = true },
-            .{ .name = "run_models", .ctxs = run_ctx, .use_map = true },
-            .{ .name = "match_models", .ctxs = match_update_ctx, .use_map = false },
-            .{ .name = "double_indirect_models", .ctxs = double_ind_ctx, .use_map = true },
-        };
-        inline for (update_configs) |cfg| {
-            const array = &@field(self, cfg.name);
-            inline for (array, 0..) |*model, i| {
-                if (cfg.use_map) {
-                    model.byteUpdate(cfg.ctxs[i], map_len);
-                } else {
-                    model.byteUpdate(cfg.ctxs[i], history_slice);
-                }
-            }
+        // Update direct model context
+        self.direct_bracket_model.byteUpdate(self.bracket_context.context);
+
+        // Update match models contexts
+        inline for (&self.match_models, 0..) |*model, i| {
+            model.byteUpdate(match_update_ctx[i], history_slice);
         }
 
-        self.direct_bracket_model.byteUpdate(self.bracket.getBracketContext());
+        // Update NS models contexts
+        self.indirect_ns_models[0].byteUpdate(self.bracket_context.context, map_len); // Bracket context
+        
+        const sparse_ctx = .{
+            s_0,
+            s_0_1,
+            s_1,
+            s_1_2,
+            s_1_3,
+            s_2_3,
+            s_3_4,
+            s_1_2_4,
+            s_2_3_4,
+            s_2,
+        };
+        inline for (1..11) |i| {
+            self.indirect_ns_models[i].byteUpdate(sparse_ctx[i - 1], map_len);
+        }
 
+        const double_ind_ctx = .{ self.ind1, self.ind2, self.ind3, self.ind5 };
+        inline for (11..15) |i| {
+            self.indirect_ns_models[i].byteUpdate(double_ind_ctx[i - 11], map_len);
+        }
+
+        // Update run map model context
+        self.indirect_r_model.byteUpdate(s_1, map_len);
+
+        // Update self.longest_match from match models
         inline for (&self.match_models) |*model| {
             self.longest_match = @max(self.longest_match, @as(u64, model.match_length) / 32);
         }
@@ -878,10 +936,26 @@ pub const Predictor = struct {
             for (0..256) |j| {
                 self.byte_mixer_tree[256 + j] = self.byte_mixer_probs[j];
             }
-            var idx: usize = 255;
-            while (idx >= 1) : (idx -= 1) {
-                self.byte_mixer_tree[idx] = self.byte_mixer_tree[2 * idx] + self.byte_mixer_tree[2 * idx + 1];
+            var l_idx: usize = 255;
+            while (l_idx >= 1) : (l_idx -= 1) {
+                self.byte_mixer_tree[l_idx] = self.byte_mixer_tree[2 * l_idx] + self.byte_mixer_tree[2 * l_idx + 1];
             }
+
+            self.byte_mixer_output = self.predict_lstm_bit(1);
+
+            const bot = 0;
+            const top = 255;
+            var lstmex: i32 = bot;
+            var max_prob_val = self.byte_mixer_probs[bot];
+            var i_idx: usize = bot + 1;
+            while (i_idx <= top) : (i_idx += 1) {
+                if (self.byte_mixer_probs[i_idx] > max_prob_val) {
+                    max_prob_val = self.byte_mixer_probs[i_idx];
+                    lstmex = @intCast(i_idx);
+                }
+            }
+            self.lstm_ex = lstmex;
+            self.lstm_pr = @intFromFloat(1.0 + 4094.0 * self.byte_mixer_output);
         }
     }
 };
@@ -890,4 +964,23 @@ inline fn getDecay(steps: usize) f32 {
     if (steps < 1000000) return 1.0;
     if (steps < 5000000) return 0.7;
     return 0.3;
+}
+
+inline fn logit(p: f32) f32 {
+    const min_p = 0.0001;
+    const max_p = 0.9999;
+    const cp = if (p < min_p) min_p else if (p > max_p) max_p else p;
+    return @log(cp / (1.0 - cp));
+}
+
+inline fn logistic(x: f32) f32 {
+    return 1.0 / (1.0 + @exp(-x));
+}
+
+inline fn hashBytes(bytes: []const u8) u64 {
+    var h: u64 = 0xcbf29ce484222325;
+    for (bytes) |b| {
+        h = (h ^ b) *% 0x100000001b3;
+    }
+    return h;
 }
